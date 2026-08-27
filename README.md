@@ -24,9 +24,9 @@ Data source: **Bundesnetzagentur | SMARD.de**, licensed CC BY 4.0
 (https://creativecommons.org/licenses/by/4.0/) — the DE-LU day-ahead
 wholesale price; values reshaped to JSON, no content altered.
 
-Evidence-tier note (honest): this German ledger is currently
-**git-attested** (every tick commits and pushes `Data/`, so commit push
-times bound the receipts) but not yet OpenTimestamps/Bitcoin-anchored like
-the Spanish ledger — Bitcoin anchoring for DE is a planned addition. Absolute
+Evidence-tier note (honest): this German ledger is git-attested and, from
+2026-08-27, OpenTimestamps/Bitcoin-anchored per tick (like the Spanish
+ledger); the earlier DE days (2026-08-24 → 08-26) are git-attested only
+because timestamps cannot be backdated. Absolute
 EUR is an upper bound (exchange fees only). Reproduce: `uv sync && uv run
 pytest`, then follow VERIFY.md.

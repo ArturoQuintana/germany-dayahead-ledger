@@ -10,14 +10,18 @@ prices. Don't trust us — check it.
 The German day-ahead auction publishes delivery-day T prices ~12:40 CET on
 T-1. A receipt for target T is honest only if it existed before that.
 
-- **git-attested (this tier):** every tick commits and pushes `Data/`.
-  Compare a receipt's `committed_at` (UTC, in the file) with the push time of
-  the commit that introduced it: `git log --follow --format='%H %cI' --
+- **git-attested:** every tick commits and pushes `Data/`. Compare a
+  receipt's `committed_at` (UTC, in the file) with the push time of the
+  commit that introduced it: `git log --follow --format='%H %cI' --
   Data/receipts.jsonl`. The commits are authored on the always-on server.
-- **NOT yet Bitcoin-anchored:** unlike the Spanish ledger, DE does not yet
-  carry OpenTimestamps proofs — that is a disclosed, planned addition. Until
-  then the timing tier is git-attestation, which trusts GitHub's commit
-  timestamps. Stated plainly rather than overclaimed.
+- **Bitcoin-anchored (OpenTimestamps) from 2026-08-27:** each tick now
+  stamps `Data/ots/<date>.txt` (a sha256 manifest of receipts + ledger) and
+  a `<date>.txt.ots` proof, upgraded to Bitcoin anchoring weekly. Verify:
+  `sha256sum Data/receipts.jsonl` against the manifest, then
+  `ots verify Data/ots/<date>.txt.ots`. Evidence tiers, stated plainly: the
+  earlier DE days (2026-08-24 → 2026-08-26) are git-attested only — OTS
+  anchoring cannot be backdated (that is the point of the mechanism), so it
+  begins the day it was added.
 
 ## 2. Arithmetic (P&L follows from receipts + public prices)
 
