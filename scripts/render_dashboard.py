@@ -1,4 +1,229 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><title>Germany day-ahead ledger</title>
+"""Render the public ledger dashboard (static index.html) from Data/.
+
+Everything is computed from the audit files — no hand-maintained numbers.
+Run after each tick (server) or manually:
+    uv run python scripts/render_dashboard.py [out_path]
+Default out: site/index.html (the mirror publishes it via GitHub Pages).
+"""
+from __future__ import annotations
+
+import json
+import statistics
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "Data"
+PRIMARY = "battery-2h2h-persistence"
+NAMES = {"battery-2h2h-persistence": "Persistence v1",
+         "battery-2h2h-climatology": "Climatology v1",
+         "battery-2h2h-rankblend": "Rank-blend v1",
+         "battery-2h2h-weekly": "Weekly v1"}
+GATE_DAYS = 21
+
+# Per-market presentation. ES is the default and keeps the public page
+# byte-identical; other markets override the labels and drop the ES-only gate.
+MARKETS = {
+    "es": {"data": DATA, "title": "Spanish day-ahead battery arbitrage",
+           "tzlabel": "Madrid", "gate": True,
+           "source": "apidatos.ree.es,\n      cross-checked weekly against "
+                     "the independent token ESIOS route"},
+    "de": {"data": DATA / "de", "title": "German (DE-LU) day-ahead battery arbitrage",
+           "tzlabel": "Berlin", "gate": False,
+           "source": "Bundesnetzagentur | SMARD.de (CC BY 4.0)"},
+    "it": {"data": DATA / "it", "title": "Italian (IT-SUD) day-ahead battery arbitrage",
+           "tzlabel": "Rome", "gate": False,
+           "source": "ENTSO-E (private use; prices not redistributed)"},
+}
+
+
+def jsonl(p: Path) -> list[dict]:
+    if not p.exists():
+        return []
+    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+
+
+def day_curves(data: Path = DATA) -> dict[str, list[float | None]]:
+    by: dict[str, dict[int, float]] = {}
+    for r in json.loads((data / "prices.json").read_text()):
+        d, h = r["ts"].split("T")
+        by.setdefault(d, {})[int(h)] = r["price"]
+    return {d: [v.get(h) for h in range(24)] for d, v in by.items()}
+
+
+def fmt(x: float) -> str:
+    return f"{x:,.2f}"
+
+
+def build(slug: str = "es") -> str:
+    cfg = MARKETS[slug]
+    DATA = cfg["data"]
+    ledger = jsonl(DATA / "ledger.jsonl")
+    receipts = jsonl(DATA / "receipts.jsonl")
+    curves = day_curves(DATA)
+    now = datetime.now(ZoneInfo("Europe/Madrid"))
+
+    prim = [e for e in ledger if e["strategy"] == PRIMARY]
+    prim_by_day = {e["target"]: e for e in prim}
+    total = sum(e["pnl_eur"] for e in prim)
+    oracle_total = sum(e["oracle_pnl_eur"] for e in prim)
+    caps = [e["capture"] for e in prim if e.get("capture") is not None]
+    cap_mean = statistics.fmean(caps) * 100 if caps else 0
+    wins = sum(1 for e in prim if e["pnl_eur"] > 0)
+
+    # missed primary days: dates in [first receipt target, last settled target]
+    # with no primary receipt at all
+    prim_receipts = {r["target"] for r in receipts if r["strategy"] == PRIMARY}
+    d0 = date.fromisoformat(min(prim_receipts))
+    d1 = date.fromisoformat(max(e["target"] for e in prim))
+    missed = []
+    d = d0
+    while d <= d1:
+        if d.isoformat() not in prim_receipts:
+            missed.append(d.isoformat())
+        d += timedelta(days=1)
+
+    settled_keys = {(e["target"], e["strategy"]) for e in ledger}
+    open_receipts = [r for r in receipts
+                     if (r["target"], r["strategy"]) not in settled_keys]
+
+    # day cards for the primary (curve + basis curve joined from receipts)
+    prim_receipt_by_target = {r["target"]: r for r in receipts
+                              if r["strategy"] == PRIMARY}
+    days_js = []
+    for e in prim:
+        t = e["target"]
+        rec = prim_receipt_by_target.get(t, {})
+        basis_day = rec.get("basis_day")
+        if t not in curves or basis_day not in curves:
+            continue
+        if any(v is None for v in curves[t] + curves[basis_day]):
+            continue
+        days_js.append({
+            "target": t,
+            "weekday": date.fromisoformat(t).strftime("%A"),
+            "buy": e["buy_hours"], "sell": e["sell_hours"],
+            "pnl": e["pnl_eur"], "oracle": e["oracle_pnl_eur"],
+            "capture": e["capture"], "tau": e.get("tau"),
+            "prices": curves[t], "basis": curves[basis_day],
+            "basisDate": basis_day,
+        })
+
+    # head-to-head: one row per settled day, one cell per strategy
+    strategies = [s for s in NAMES if any(e["strategy"] == s for e in ledger)]
+    by_day: dict[str, dict[str, dict]] = {}
+    for e in ledger:
+        by_day.setdefault(e["target"], {})[e["strategy"]] = e
+    h2h_rows = []
+    for t in sorted(set(list(by_day) + missed)):
+        cells = []
+        for s in strategies:
+            e = by_day.get(t, {}).get(s)
+            if e is None:
+                cells.append("<td>missed</td>" if s == PRIMARY and t in missed
+                             else "<td>—</td>")
+            else:
+                cap = (f"{e['capture'] * 100:.1f}%"
+                       if e.get("capture") is not None else "n/a")
+                tau = (f" · tau {e['tau']:.3f}"
+                       if e.get("tau") is not None else "")
+                cells.append(f"<td>+{fmt(e['pnl_eur'])}&thinsp;€ ({cap}{tau})"
+                             "</td>")
+        h2h_rows.append(f'<tr><td class="k">{t}</td>{"".join(cells)}</tr>')
+    # pairwise totals vs primary on shared days
+    pair_notes = []
+    for s in strategies:
+        if s == PRIMARY:
+            continue
+        shared = [(by_day[t][s]["pnl_eur"], by_day[t][PRIMARY]["pnl_eur"])
+                  for t in by_day if s in by_day[t] and PRIMARY in by_day[t]]
+        if shared:
+            delta = sum(a - b for a, b in shared)
+            pair_notes.append(f"{NAMES[s]} vs {NAMES[PRIMARY]}: "
+                              f"{delta:+.2f}&thinsp;€ over {len(shared)} "
+                              "shared days")
+    h2h_head = "".join(f"<th>{NAMES[s]}{' · primary' if s == PRIMARY else ' · shadow'}</th>"
+                       for s in strategies)
+
+    ledger_rows = []
+    for e in prim:
+        buy_avg = statistics.fmean(e["buy_prices"])
+        sell_avg = statistics.fmean(e["sell_prices"])
+        cap = (f"{e['capture'] * 100:.1f}%"
+               if e.get("capture") is not None else "n/a")
+        ledger_rows.append(
+            f'<tr><td class="k">{e["target"]}</td>'
+            f'<td>{", ".join(f"{h:02d}" for h in e["buy_hours"])}</td>'
+            f"<td>{fmt(buy_avg)}</td>"
+            f'<td>{", ".join(f"{h:02d}" for h in e["sell_hours"])}</td>'
+            f"<td>{fmt(sell_avg)}</td>"
+            f'<td class="pos">+{fmt(e["pnl_eur"])}</td>'
+            f"<td>{fmt(e['oracle_pnl_eur'])}</td><td>{cap}</td></tr>")
+    for m in missed:
+        ledger_rows.append(
+            f'<tr><td class="k">{m}</td><td colspan="6" style="text-align:'
+            'left">missed — no receipt committed before the window closed; '
+            "never backfilled (leak guard)</td><td>—</td></tr>")
+
+    open_html = []
+    for r in open_receipts:
+        open_html.append(
+            f'<div class="open-card" style="margin-bottom:10px">'
+            f'<span class="pending">Pending</span>'
+            f'<span class="oc"><b>{r["target"]}</b> · {NAMES.get(r["strategy"], r["strategy"])}'
+            f'{" · primary" if r["strategy"] == PRIMARY else " · shadow"}</span>'
+            f'<span class="oc">buy <b class="m">{"·".join(f"{h:02d}" for h in r["buy_hours"])}h</b>'
+            f' · sell <b class="m">{"·".join(f"{h:02d}" for h in r["sell_hours"])}h</b></span>'
+            f'<span class="oc">committed <span class="m">{r["committed_at"][:16]}Z</span>,'
+            f' before publication</span></div>')
+    if not open_html:
+        open_html = ['<div class="open-card"><span class="pending">None open'
+                     '</span><span class="oc">Next commit at the next 11:00 '
+                     'Europe/Madrid tick.</span></div>']
+
+    if cfg["gate"]:
+        gate_cells = "".join(f'<i class="{"done" if i < len(prim) else ""}"></i>'
+                             for i in range(GATE_DAYS))
+        gate_tile = (
+            '<div class="tile"><div class="k">GBM v2 gate</div>'
+            f'<div class="v">{min(len(prim), GATE_DAYS)} / {GATE_DAYS}</div>'
+            '<div class="s">settled days · evaluate ~21 Aug</div></div>')
+        gate_section = (
+            '<h2>Escalation gate</h2><div class="gate">'
+            '<div class="gl"><span>Progress to the GBM&nbsp;v2 evaluation</span>'
+            f'<span class="m">{min(len(prim), GATE_DAYS)} of {GATE_DAYS} settled days</span></div>'
+            f'<div class="gate-cells">{gate_cells}</div>'
+            '<div class="gl"><span>Evaluation criteria frozen in advance; stop '
+            'conditions pre-registered</span><span class="m">~21 Aug 2026</span></div></div>')
+    else:
+        gate_tile = (
+            '<div class="tile"><div class="k">Market</div>'
+            f'<div class="v">{slug.upper()}</div>'
+            '<div class="s">silent shadow ledger</div></div>')
+        gate_section = ""
+
+    return TEMPLATE % {
+        "tabtitle": {"es": "Spain", "de": "Germany", "it": "Italy"}[slug]
+                    + " day-ahead ledger",
+        "title": cfg["title"],
+        "source": cfg.get("source", "apidatos.ree.es"),
+        "asof": now.strftime(f"%Y-%m-%d %H:%M {cfg['tzlabel']}"),
+        "total": fmt(total), "oracle_total": fmt(oracle_total),
+        "cap_mean": f"{cap_mean:.1f}", "wins": wins, "n": len(prim),
+        "missed_n": len(missed),
+        "gate_tile": gate_tile, "gate_section": gate_section,
+        "days_json": json.dumps(days_js),
+        "open_cards": "\n".join(open_html),
+        "h2h_head": h2h_head, "h2h_rows": "\n".join(h2h_rows),
+        "pair_notes": " · ".join(pair_notes) or "no shared shadow days yet",
+        "n_strategies": len(strategies),
+        "ledger_rows": "\n".join(ledger_rows),
+    }
+
+
+TEMPLATE = """<title>%(tabtitle)s</title>
 <style>
   :root { color-scheme: light;
     --bg:#f9f9f7; --card:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e;
@@ -39,14 +264,14 @@
   .chips { margin-left:auto; display:flex; gap:8px; }
   .chip { font:500 12.5px/1 var(--mono); padding:5px 9px; border-radius:99px;
     border:1px solid var(--border); color:var(--ink2); white-space:nowrap; }
-  .chip.pnl-pos { color:var(--good); border-color:color-mix(in srgb,var(--good) 35%,transparent); }
-  .chip.pnl-neg { color:var(--bad); border-color:color-mix(in srgb,var(--bad) 35%,transparent); }
+  .chip.pnl-pos { color:var(--good); border-color:color-mix(in srgb,var(--good) 35%%,transparent); }
+  .chip.pnl-neg { color:var(--bad); border-color:color-mix(in srgb,var(--bad) 35%%,transparent); }
   .day-sub { color:var(--ink2); font-size:13px; margin:0 0 10px; }
   .day-sub .m { font-family:var(--mono); font-size:12px; }
   .legend { display:flex; flex-wrap:wrap; gap:6px 18px; margin:2px 0 24px; align-items:center; }
   .legend .li { display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--ink2); }
   .chart-box { position:relative; }
-  .chart-box svg { display:block; width:100%; height:auto; }
+  .chart-box svg { display:block; width:100%%; height:auto; }
   .tip { position:absolute; pointer-events:none; display:none; background:var(--card);
     border:1px solid var(--border); border-radius:5px; box-shadow:0 2px 10px rgba(0,0,0,.14);
     font:500 12px/1.5 var(--mono); color:var(--ink); padding:7px 10px; white-space:nowrap; z-index:3; }
@@ -66,7 +291,7 @@
   .gate .gl { display:flex; justify-content:space-between; color:var(--ink2); font-size:12.5px; }
   .gate .gl .m { font-family:var(--mono); font-size:12px; }
   .tbl-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:6px; background:var(--card); }
-  table { border-collapse:collapse; width:100%; min-width:640px; font-size:13px; }
+  table { border-collapse:collapse; width:100%%; min-width:640px; font-size:13px; }
   th, td { text-align:right; padding:9px 14px; border-top:1px solid var(--grid); white-space:nowrap; }
   th { border-top:0; font:600 10.5px/1 var(--mono); letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
   th:first-child, td:first-child { text-align:left; }
@@ -81,23 +306,23 @@
 <div class="wrap">
   <header>
     <p class="eyebrow">esios-paper · paper-trading ledger</p>
-    <h1>German (DE-LU) day-ahead battery arbitrage</h1>
+    <h1>%(title)s</h1>
     <p class="asof">1 MW / 2 MWh virtual battery · decisions committed before price publication
-      (leak-guarded, OpenTimestamps-anchored) · data as of <code>2026-08-27 17:29 Berlin</code> ·
+      (leak-guarded, OpenTimestamps-anchored) · data as of <code>%(asof)s</code> ·
       generated from the audit files, no hand-edited numbers</p>
   </header>
 
   <div class="tiles">
     <div class="tile"><div class="k">Net P&amp;L · paper</div>
-      <div class="v pos">+1,086.59&thinsp;€</div>
-      <div class="s">of 1,099.16&thinsp;€ oracle ceiling</div></div>
+      <div class="v pos">+%(total)s&thinsp;€</div>
+      <div class="s">of %(oracle_total)s&thinsp;€ oracle ceiling</div></div>
     <div class="tile"><div class="k">Mean capture</div>
-      <div class="v">98.1%</div>
+      <div class="v">%(cap_mean)s%%</div>
       <div class="s">of perfect-hindsight P&amp;L</div></div>
     <div class="tile"><div class="k">Record</div>
-      <div class="v">5 / 5</div>
-      <div class="s">winning settled days · 0 missed</div></div>
-    <div class="tile"><div class="k">Market</div><div class="v">DE</div><div class="s">silent shadow ledger</div></div>
+      <div class="v">%(wins)s / %(n)s</div>
+      <div class="s">winning settled days · %(missed_n)s missed</div></div>
+    %(gate_tile)s
   </div>
 
   <h2>Settled days · primary strategy</h2>
@@ -105,45 +330,37 @@
   <div id="days"></div>
 
   <h2>Open receipts</h2>
-  <div class="open-card"><span class="pending">None open</span><span class="oc">Next commit at the next 11:00 Europe/Madrid tick.</span></div>
+  %(open_cards)s
 
   <h2>Strategy panel · identical settled days</h2>
   <div class="tbl-wrap"><table>
-    <thead><tr><th>Target day</th><th>Persistence v1 · primary</th><th>Climatology v1 · shadow</th><th>Rank-blend v1 · shadow</th><th>Weekly v1 · shadow</th></tr></thead>
-    <tbody><tr><td class="k">2026-08-24</td><td>+301.40&thinsp;€ (100.0% · tau 0.710)</td><td>+274.77&thinsp;€ (91.2% · tau 0.826)</td><td>+274.77&thinsp;€ (91.2% · tau 0.785)</td><td>+169.99&thinsp;€ (56.4% · tau 0.645)</td></tr>
-<tr><td class="k">2026-08-25</td><td>+219.76&thinsp;€ (99.4% · tau 0.848)</td><td>+219.76&thinsp;€ (99.4% · tau 0.826)</td><td>+219.76&thinsp;€ (99.4% · tau 0.878)</td><td>+196.97&thinsp;€ (89.1% · tau 0.870)</td></tr>
-<tr><td class="k">2026-08-26</td><td>+161.08&thinsp;€ (96.0% · tau 0.819)</td><td>+167.72&thinsp;€ (100.0% · tau 0.710)</td><td>+161.08&thinsp;€ (96.0% · tau 0.786)</td><td>+167.72&thinsp;€ (100.0% · tau 0.790)</td></tr>
-<tr><td class="k">2026-08-27</td><td>+309.53&thinsp;€ (100.0% · tau 0.833)</td><td>+309.53&thinsp;€ (100.0% · tau 0.870)</td><td>+309.53&thinsp;€ (100.0% · tau 0.930)</td><td>+289.69&thinsp;€ (93.6% · tau 0.848)</td></tr>
-<tr><td class="k">2026-08-28</td><td>+94.82&thinsp;€ (95.3% · tau 0.826)</td><td>+94.82&thinsp;€ (95.3% · tau 0.754)</td><td>+94.82&thinsp;€ (95.3% · tau 0.806)</td><td>+62.59&thinsp;€ (62.9% · tau 0.768)</td></tr></tbody>
+    <thead><tr><th>Target day</th>%(h2h_head)s</tr></thead>
+    <tbody>%(h2h_rows)s</tbody>
   </table></div>
-  <p class="note">Climatology v1 vs Persistence v1: -19.99&thinsp;€ over 5 shared days · Rank-blend v1 vs Persistence v1: -26.63&thinsp;€ over 5 shared days · Weekly v1 vs Persistence v1: -199.63&thinsp;€ over 5 shared days. Claims of superiority require the
+  <p class="note">%(pair_notes)s. Claims of superiority require the
     pre-registered bar (&ge;30 non-tied shared days, sign-test p&lt;0.05) —
-    see VERIFY.md. All 4 strategies settle on identical days
+    see VERIFY.md. All %(n_strategies)s strategies settle on identical days
     with identical costs; none can be revised after the fact.</p>
 
-  
+  %(gate_section)s
 
   <h2>Ledger · append-only · primary</h2>
   <div class="tbl-wrap"><table>
     <thead><tr><th>Target day</th><th>Buy hours</th><th>Buy avg</th>
       <th>Sell hours</th><th>Sell avg</th><th>P&amp;L</th><th>Oracle</th>
       <th>Capture</th></tr></thead>
-    <tbody><tr><td class="k">2026-08-24</td><td>13, 14</td><td>34.91</td><td>19, 20</td><td>219.45</td><td class="pos">+301.40</td><td>301.40</td><td>100.0%</td></tr>
-<tr><td class="k">2026-08-25</td><td>13, 14</td><td>65.33</td><td>19, 20</td><td>207.22</td><td class="pos">+219.76</td><td>221.06</td><td>99.4%</td></tr>
-<tr><td class="k">2026-08-26</td><td>12, 13</td><td>94.08</td><td>19, 20</td><td>206.51</td><td class="pos">+161.08</td><td>167.72</td><td>96.0%</td></tr>
-<tr><td class="k">2026-08-27</td><td>13, 14</td><td>10.38</td><td>19, 20</td><td>195.38</td><td class="pos">+309.53</td><td>309.53</td><td>100.0%</td></tr>
-<tr><td class="k">2026-08-28</td><td>13, 14</td><td>100.12</td><td>19, 20</td><td>174.66</td><td class="pos">+94.82</td><td>99.45</td><td>95.3%</td></tr></tbody>
+    <tbody>%(ledger_rows)s</tbody>
   </table></div>
 
   <footer>
-    <p>Costs are explicit in every figure: 85% round-trip efficiency and
+    <p>Costs are explicit in every figure: 85%% round-trip efficiency and
       0.50&thinsp;€/MWh fees on every MWh moved — net is never reported as
       gross. The oracle is the best possible 2×2 hour choice with hindsight,
       same battery, same costs. Capture = P&amp;L ÷ oracle P&amp;L; tau =
       Kendall tau-b of the committed forecast vs the actual day.</p>
     <p>Paper money — no capital at stake. Every receipt is committed and
       pushed before the D+1 auction publishes (~13:15 CET); the ledger is
-      append-only and OpenTimestamps-anchored; prices: Bundesnetzagentur | SMARD.de (CC BY 4.0).
+      append-only and OpenTimestamps-anchored; prices: %(source)s.
       Absolute EUR is an <b>upper bound</b> (exchange fees only — no grid
       charges, taxes, or aggregator margin); relative metrics are robust.
       Verify everything yourself: see VERIFY.md in this repository.</p>
@@ -151,7 +368,7 @@
 </div>
 
 <script>
-  const DAYS = [{"target": "2026-08-24", "weekday": "Monday", "buy": [13, 14], "sell": [19, 20], "pnl": 301.4, "oracle": 301.4, "capture": 1.0, "tau": 0.71, "prices": [160.93, 152.62, 147.88, 148.74, 151.3, 172.67, 205.67, 206.4, 176.78, 141.35, 112.57, 80.26, 55.63, 34.15, 35.66, 72.5, 102.09, 143.46, 182.34, 219.37, 219.53, 188.03, 171.77, 154.73], "basis": [132.67, 125.82, 119.37, 116.21, 114.74, 116.73, 116.71, 102.09, 49.83, 1.01, -0.57, -1.83, -3.04, -5.0, -4.23, -1.48, -0.53, 48.38, 144.42, 180.2, 185.89, 178.05, 172.68, 165.45], "basisDate": "2026-08-23"}, {"target": "2026-08-25", "weekday": "Tuesday", "buy": [13, 14], "sell": [19, 20], "pnl": 219.76, "oracle": 221.06, "capture": 0.994, "tau": 0.848, "prices": [152.34, 146.83, 142.42, 140.01, 141.62, 149.58, 171.42, 180.66, 171.41, 145.44, 117.46, 83.15, 67.16, 62.21, 68.46, 85.0, 114.4, 147.05, 178.78, 209.31, 205.14, 182.49, 172.27, 159.66], "basis": [160.93, 152.62, 147.88, 148.74, 151.3, 172.67, 205.67, 206.4, 176.78, 141.35, 112.57, 80.26, 55.63, 34.15, 35.66, 72.5, 102.09, 143.46, 182.34, 219.37, 219.53, 188.03, 171.77, 154.73], "basisDate": "2026-08-24"}, {"target": "2026-08-26", "weekday": "Wednesday", "buy": [12, 13], "sell": [19, 20], "pnl": 161.08, "oracle": 167.72, "capture": 0.96, "tau": 0.819, "prices": [164.03, 157.06, 151.64, 149.6, 151.76, 160.47, 185.13, 195.54, 193.52, 166.62, 137.48, 120.66, 98.61, 89.54, 91.97, 102.55, 122.51, 156.97, 185.63, 211.25, 201.78, 178.69, 163.59, 151.11], "basis": [152.34, 146.83, 142.42, 140.01, 141.62, 149.58, 171.42, 180.66, 171.41, 145.44, 117.46, 83.15, 67.16, 62.21, 68.46, 85.0, 114.4, 147.05, 178.78, 209.31, 205.14, 182.49, 172.27, 159.66], "basisDate": "2026-08-25"}, {"target": "2026-08-27", "weekday": "Thursday", "buy": [13, 14], "sell": [19, 20], "pnl": 309.53, "oracle": 309.53, "capture": 1.0, "tau": 0.833, "prices": [148.55, 142.18, 135.17, 134.42, 136.19, 146.56, 167.58, 174.14, 160.39, 124.65, 104.1, 57.58, 21.68, 6.57, 14.19, 45.38, 96.15, 141.7, 173.81, 199.26, 191.49, 175.92, 164.92, 150.39], "basis": [164.03, 157.06, 151.64, 149.6, 151.76, 160.47, 185.13, 195.54, 193.52, 166.62, 137.48, 120.66, 98.61, 89.54, 91.97, 102.55, 122.51, 156.97, 185.63, 211.25, 201.78, 178.69, 163.59, 151.11], "basisDate": "2026-08-26"}, {"target": "2026-08-28", "weekday": "Friday", "buy": [13, 14], "sell": [19, 20], "pnl": 94.82, "oracle": 99.45, "capture": 0.953, "tau": 0.826, "prices": [139.52, 139.29, 138.24, 138.8, 139.09, 146.77, 171.01, 177.98, 169.47, 155.15, 137.64, 121.58, 110.89, 96.24, 104.0, 114.37, 119.56, 143.2, 160.48, 172.54, 176.77, 166.11, 161.45, 145.13], "basis": [148.55, 142.18, 135.17, 134.42, 136.19, 146.56, 167.58, 174.14, 160.39, 124.65, 104.1, 57.58, 21.68, 6.57, 14.19, 45.38, 96.15, 141.7, 173.81, 199.26, 191.49, 175.92, 164.92, 150.39], "basisDate": "2026-08-27"}];
+  const DAYS = %(days_json)s;
   const fmt = (x, d = 2) => x.toLocaleString("en-GB", { minimumFractionDigits: d, maximumFractionDigits: d });
   const avg = a => a.reduce((s, x) => s + x, 0) / a.length;
   const hh = h => String(h).padStart(2, "0");
@@ -191,7 +408,7 @@
         <span class="date">${d.target}</span><span class="wd">${d.weekday}</span>
         <span class="chips">
           <span class="chip ${d.pnl >= 0 ? "pnl-pos" : "pnl-neg"}">${d.pnl >= 0 ? "+" : "−"}${fmt(Math.abs(d.pnl))} €</span>
-          <span class="chip">capture ${d.capture != null ? (d.capture * 100).toFixed(1) + "%" : "n/a"}</span>
+          <span class="chip">capture ${d.capture != null ? (d.capture * 100).toFixed(1) + "%%" : "n/a"}</span>
           ${d.tau != null ? `<span class="chip">tau ${d.tau.toFixed(3)}</span>` : ""}
         </span>
       </div>
@@ -246,4 +463,25 @@
     });
   });
 </script>
-</body></html>
+"""
+
+
+def main() -> None:
+    args = [a for a in sys.argv[1:]]
+    slug = "es"
+    if "--market" in args:
+        i = args.index("--market")
+        slug = args[i + 1]
+        del args[i:i + 2]
+    out = Path(args[0]) if args else ROOT / ("site/index.html" if slug == "es"
+                                             else f"site/{slug}.html")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    html = "<!doctype html><html><head><meta charset=\"utf-8\">" \
+           "<meta name=\"viewport\" content=\"width=device-width," \
+           "initial-scale=1\"></head><body>" + build(slug) + "</body></html>"
+    out.write_text(html)
+    print(f"rendered {out} ({len(html)} bytes)")
+
+
+if __name__ == "__main__":
+    main()

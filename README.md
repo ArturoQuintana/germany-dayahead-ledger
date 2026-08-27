@@ -1,6 +1,13 @@
 # A committed-before-truth ledger for German (DE-LU) day-ahead power
 
+[![verify](https://github.com/ArturoQuintana/germany-dayahead-ledger/actions/workflows/verify.yml/badge.svg)](https://github.com/ArturoQuintana/germany-dayahead-ledger/actions/workflows/verify.yml)
+
 **Live dashboard:** see `index.html` (GitHub Pages) · **Audit it yourself:** [VERIFY.md](VERIFY.md)
+
+The badge above is not decorative: GitHub re-runs `scripts/verify_ledger.py`
+on this repository daily and on every update, independently re-deriving every
+settlement from the raw prices and receipts. Green means the numbers reconcile;
+you can run the identical command yourself (see [VERIFY.md](VERIFY.md)).
 
 The public, auditable record of a paper-trading experiment on German
 (DE-LU) day-ahead electricity prices. Every day, BEFORE the German
